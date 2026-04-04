@@ -1,7 +1,9 @@
-import dotenv from 'dotenv'
 import path from 'path'
 
-dotenv.config({ path: path.resolve(__dirname, '../../.env') })
+if (process.env.NODE_ENV !== 'production') {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  require('dotenv').config({ path: path.resolve(__dirname, '../../.env') })
+}
 
 const requiredVars = ['MONGODB_URI', 'JWT_SECRET'] as const
 
