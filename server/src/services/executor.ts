@@ -98,12 +98,15 @@ async function executeViaJudge0(
 // ---------------------------------------------------------------------------
 
 const EXEC_DIR = '/tmp/cba-exec'
+const COMPILE_TIMEOUT_MS = 30000
+const RUN_TIMEOUT_MS = 10000
 
 interface LangConfig {
   ext: string
   filename: string
   compile?: (dir: string) => string
   run: (dir: string) => string
+  binaryName?: string // used for cache check
 }
 
 const LANG_CONFIGS: Record<string, LangConfig> = {
@@ -112,6 +115,7 @@ const LANG_CONFIGS: Record<string, LangConfig> = {
     filename: 'solution.cpp',
     compile: (dir) => `g++ -O2 -o ${dir}/solution ${dir}/solution.cpp`,
     run: (dir) => `${dir}/solution`,
+    binaryName: 'solution',
   },
   python: {
     ext: '.py',
@@ -128,7 +132,28 @@ const LANG_CONFIGS: Record<string, LangConfig> = {
     filename: 'Main.java',
     compile: (dir) => `javac ${dir}/Main.java`,
     run: (dir) => `java -cp ${dir} Main`,
+    binaryName: 'Main.class',
   },
+}
+
+// Compilation cache: hash(code+language) → dir with compiled binary
+const compileCache = new Map<string, { dir: string; ts: number }>()
+const CACHE_TTL_MS = 5 * 60 * 1000
+const CACHE_MAX = 50
+
+function cacheKey(code: string, language: string): string {
+  return crypto.createHash('md5').update(`${language}:${code}`).digest('hex')
+}
+
+function pruneCache() {
+  if (compileCache.size <= CACHE_MAX) return
+  const now = Date.now()
+  for (const [key, entry] of compileCache) {
+    if (now - entry.ts > CACHE_TTL_MS) {
+      rm(entry.dir, { recursive: true, force: true }).catch(() => {})
+      compileCache.delete(key)
+    }
+  }
 }
 
 async function executeLocally(
@@ -140,45 +165,78 @@ async function executeLocally(
   }
 
   const id = crypto.randomBytes(8).toString('hex')
-  const dir = path.join(EXEC_DIR, id)
+  const runDir = path.join(EXEC_DIR, id)
+  let usedCacheDir: string | null = null
 
   try {
-    await mkdir(dir, { recursive: true })
-    const filePath = path.join(dir, config.filename)
-    await writeFile(filePath, code)
-    const inputPath = path.join(dir, 'input.txt')
+    await mkdir(runDir, { recursive: true })
+
+    const inputPath = path.join(runDir, 'input.txt')
     await writeFile(inputPath, stdin)
 
-    const timeoutSec = Math.max(1, Math.ceil(Math.min(timeLimit, 5000) / 1000))
+    let execDir = runDir
 
-    // Compile step (C++, Java)
+    // Check compile cache for compiled languages
     if (config.compile) {
-      const compileResult = await runCommand(config.compile(dir), dir, 10000)
-      if (compileResult.exitCode !== 0) {
-        return {
-          stdout: '',
-          stderr: compileResult.stderr || compileResult.stdout || 'Compilation failed',
-          exitCode: 1,
-          executionTime: compileResult.executionTime,
-          compilationError: true,
+      const key = cacheKey(code, language)
+      const cached = compileCache.get(key)
+
+      if (cached) {
+        // Reuse cached compilation
+        execDir = cached.dir
+        cached.ts = Date.now()
+        usedCacheDir = cached.dir
+      } else {
+        // Write source and compile
+        await writeFile(path.join(runDir, config.filename), code)
+
+        const compileResult = await runCommand(config.compile(runDir), runDir, COMPILE_TIMEOUT_MS)
+
+        if (compileResult.exitCode !== 0) {
+          const isTimeout = compileResult.executionTime >= COMPILE_TIMEOUT_MS - 500
+          return {
+            stdout: '',
+            stderr: isTimeout
+              ? 'Compilation timed out (30s limit)'
+              : (compileResult.stderr || compileResult.stdout || 'Compilation failed'),
+            exitCode: 1,
+            executionTime: compileResult.executionTime,
+            compilationError: true,
+          }
         }
+
+        // Cache the compiled dir — don't delete it in finally
+        compileCache.set(key, { dir: runDir, ts: Date.now() })
+        usedCacheDir = runDir
+        pruneCache()
       }
+    } else {
+      // Interpreted language — write source to run dir
+      await writeFile(path.join(runDir, config.filename), code)
     }
 
-    // Run with memory limit; Node.js timeout handles the kill
-    const runTimeoutMs = Math.min(timeLimit, 5000)
-    const cmd = `ulimit -v 262144 2>/dev/null; ${config.run(dir)} < ${inputPath}`
-    const result = await runCommand(cmd, dir, runTimeoutMs)
+    // Run with memory limit and execution timeout (separate from compile timeout)
+    const execTimeoutMs = Math.min(timeLimit, RUN_TIMEOUT_MS)
+    const cmd = `ulimit -v 262144 2>/dev/null; ${config.run(execDir)} < ${inputPath}`
+    const result = await runCommand(cmd, execDir, execTimeoutMs)
+
+    const isTimeout = result.exitCode !== 0 && result.executionTime >= execTimeoutMs - 500
 
     return {
       stdout: result.stdout,
-      stderr: result.stderr,
+      stderr: isTimeout ? 'Time limit exceeded' : result.stderr,
       exitCode: result.exitCode,
       executionTime: result.executionTime,
       compilationError: false,
     }
   } finally {
-    rm(dir, { recursive: true, force: true }).catch(() => {})
+    // Only delete runDir if it's NOT the cached compile dir
+    if (usedCacheDir !== runDir) {
+      rm(runDir, { recursive: true, force: true }).catch(() => {})
+    } else {
+      // Still clean up input.txt from cached dir
+      rm(path.join(runDir, 'input.txt'), { force: true }).catch(() => {})
+    }
   }
 }
 
