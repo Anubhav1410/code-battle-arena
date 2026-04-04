@@ -50,40 +50,36 @@ app.get('/api/health', (_req, res) => {
   res.json({ success: true, data: { status: 'ok', env: env.nodeEnv } })
 })
 
-// Debug route — test if outbound HTTP works on this host
-app.get('/api/debug/outbound', async (_req, res) => {
-  const results: Record<string, string> = {}
+// Debug route — test outbound HTTP connectivity
+app.get('/api/debug/outbound', (_req, res) => {
+  const urls = [
+    'https://httpbin.org/get',
+    'https://ce.judge0.com/about',
+    'https://judge0-ce.p.swisspol.ch/about',
+    'https://emkc.org/api/v2/piston/runtimes',
+  ]
 
-  // Test 1: generic HTTP
-  try {
-    const r = await fetch('https://httpbin.org/get')
-    results.httpbin = `${r.status} OK`
-  } catch (err: unknown) {
-    const e = err as Error & { cause?: Error; code?: string }
-    results.httpbin = `FAIL: ${e.message} | cause: ${e.cause?.message ?? 'none'} | code: ${(e.cause as Error & { code?: string })?.code ?? 'none'}`
+  async function testUrl(url: string) {
+    try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 5000)
+      const r = await fetch(url, { signal: controller.signal })
+      clearTimeout(timeout)
+      const body = await r.text()
+      return { url, status: 'ok' as const, httpStatus: r.status, body: body.slice(0, 120) }
+    } catch (err: unknown) {
+      const e = err as Error & { cause?: Error & { code?: string } }
+      return {
+        url,
+        status: 'failed' as const,
+        error: `${e.message} | cause: ${e.cause?.message ?? 'none'} | code: ${e.cause?.code ?? 'none'}`,
+      }
+    }
   }
 
-  // Test 2: Judge0 free instance
-  try {
-    const r = await fetch(`${env.judge0ApiUrl}/about`)
-    const body = await r.text()
-    results.judge0 = `${r.status} — ${body.slice(0, 100)}`
-  } catch (err: unknown) {
-    const e = err as Error & { cause?: Error }
-    results.judge0 = `FAIL: ${e.message} | cause: ${e.cause?.message ?? 'none'}`
-  }
-
-  // Test 3: ce.judge0.com
-  try {
-    const r = await fetch('https://ce.judge0.com/about')
-    const body = await r.text()
-    results.judge0_ce = `${r.status} — ${body.slice(0, 100)}`
-  } catch (err: unknown) {
-    const e = err as Error & { cause?: Error }
-    results.judge0_ce = `FAIL: ${e.message} | cause: ${e.cause?.message ?? 'none'}`
-  }
-
-  res.json({ success: true, data: results })
+  Promise.all(urls.map(testUrl))
+    .then((results) => res.json({ success: true, data: results }))
+    .catch((err) => res.status(500).json({ success: false, error: String(err) }))
 })
 
 app.use(errorHandler)
