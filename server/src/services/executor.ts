@@ -1,31 +1,38 @@
 import { env } from '../config/env'
 
-interface PistonRequest {
-  language: string
-  version: string
-  files: Array<{ content: string }>
-  stdin: string
-  compile_timeout?: number
-  run_timeout?: number
-  compile_memory_limit?: number
-  run_memory_limit?: number
+// Judge0 language IDs
+const LANGUAGE_IDS: Record<string, number> = {
+  cpp: 54,        // C++ (GCC 9.2.0)
+  python: 71,     // Python (3.8.1)
+  javascript: 63, // JavaScript (Node.js 12.14.0)
+  java: 62,       // Java (OpenJDK 13.0.1)
 }
 
-interface PistonResponse {
-  run: {
-    stdout: string
-    stderr: string
-    code: number | null
-    signal: string | null
-    output: string
-  }
-  compile?: {
-    stdout: string
-    stderr: string
-    code: number | null
-    signal: string | null
-    output: string
-  }
+// Judge0 status IDs
+const STATUS = {
+  IN_QUEUE: 1,
+  PROCESSING: 2,
+  ACCEPTED: 3,
+  WRONG_ANSWER: 4,
+  TIME_LIMIT: 5,
+  COMPILATION_ERROR: 6,
+  RUNTIME_ERROR_SIGSEGV: 7,
+  RUNTIME_ERROR_SIGXFSZ: 8,
+  RUNTIME_ERROR_SIGFPE: 9,
+  RUNTIME_ERROR_SIGABRT: 10,
+  RUNTIME_ERROR_NZEC: 11,
+  RUNTIME_ERROR_OTHER: 12,
+  INTERNAL_ERROR: 13,
+  EXEC_FORMAT_ERROR: 14,
+}
+
+interface Judge0Response {
+  stdout: string | null
+  stderr: string | null
+  compile_output: string | null
+  status: { id: number; description: string }
+  time: string | null
+  memory: number | null
 }
 
 export type Verdict = 'AC' | 'WA' | 'TLE' | 'RTE' | 'CE'
@@ -49,11 +56,16 @@ export interface ExecutionResult {
   compilationError: boolean
 }
 
-const LANGUAGE_VERSIONS: Record<string, { language: string; version: string }> = {
-  cpp: { language: 'c++', version: '10.2.0' },
-  python: { language: 'python', version: '3.10.0' },
-  javascript: { language: 'javascript', version: '18.15.0' },
-  java: { language: 'java', version: '15.0.2' },
+function buildHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  // RapidAPI requires these headers
+  if (env.judge0ApiKey) {
+    headers['X-RapidAPI-Key'] = env.judge0ApiKey
+    headers['X-RapidAPI-Host'] = 'judge0-ce.p.rapidapi.com'
+  }
+  return headers
 }
 
 export async function executeCode(
@@ -63,53 +75,71 @@ export async function executeCode(
   timeLimit: number = 2000,
   memoryLimit: number = 256
 ): Promise<ExecutionResult> {
-  const langConfig = LANGUAGE_VERSIONS[language]
-  if (!langConfig) {
+  const languageId = LANGUAGE_IDS[language]
+  if (!languageId) {
     throw new Error(`Unsupported language: ${language}`)
   }
 
-  const payload: PistonRequest = {
-    language: langConfig.language,
-    version: langConfig.version,
-    files: [{ content: code }],
-    stdin,
-    run_timeout: timeLimit,
-    compile_timeout: 10000,
-    run_memory_limit: memoryLimit * 1024 * 1024,
-    compile_memory_limit: memoryLimit * 1024 * 1024,
+  const timeLimitSeconds = Math.max(1, Math.min(timeLimit / 1000, 15))
+
+  const payload = {
+    source_code: Buffer.from(code).toString('base64'),
+    language_id: languageId,
+    stdin: Buffer.from(stdin).toString('base64'),
+    cpu_time_limit: timeLimitSeconds,
+    memory_limit: memoryLimit * 1024, // Judge0 expects KB
+    base64_encoded: true,
+    wait: true,
   }
 
   const start = Date.now()
 
-  const response = await fetch(`${env.pistonApiUrl}/execute`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  })
+  const response = await fetch(
+    `${env.judge0ApiUrl}/submissions?base64_encoded=true&wait=true&fields=stdout,stderr,compile_output,status,time,memory`,
+    {
+      method: 'POST',
+      headers: buildHeaders(),
+      body: JSON.stringify(payload),
+    }
+  )
 
   const elapsed = Date.now() - start
 
   if (!response.ok) {
-    throw new Error(`Piston API error: ${response.status} ${response.statusText}`)
+    const text = await response.text().catch(() => '')
+    throw new Error(`Judge0 API error: ${response.status} ${text}`)
   }
 
-  const result = (await response.json()) as PistonResponse
+  const result = (await response.json()) as Judge0Response
 
-  if (result.compile && result.compile.code !== 0 && result.compile.stderr) {
+  const stdout = result.stdout ? Buffer.from(result.stdout, 'base64').toString() : ''
+  const stderr = result.stderr ? Buffer.from(result.stderr, 'base64').toString() : ''
+  const compileOutput = result.compile_output
+    ? Buffer.from(result.compile_output, 'base64').toString()
+    : ''
+  const statusId = result.status.id
+  const timeMs = result.time ? Math.round(parseFloat(result.time) * 1000) : elapsed
+
+  // Compilation error
+  if (statusId === STATUS.COMPILATION_ERROR) {
     return {
       stdout: '',
-      stderr: result.compile.stderr,
-      exitCode: result.compile.code,
-      executionTime: elapsed,
+      stderr: compileOutput || stderr,
+      exitCode: 1,
+      executionTime: timeMs,
       compilationError: true,
     }
   }
 
+  // Runtime errors
+  const isRuntimeError =
+    statusId >= STATUS.RUNTIME_ERROR_SIGSEGV && statusId <= STATUS.RUNTIME_ERROR_OTHER
+
   return {
-    stdout: result.run.stdout,
-    stderr: result.run.stderr,
-    exitCode: result.run.code,
-    executionTime: elapsed,
+    stdout,
+    stderr: stderr || compileOutput,
+    exitCode: isRuntimeError || statusId === STATUS.TIME_LIMIT ? 1 : 0,
+    executionTime: timeMs,
     compilationError: false,
   }
 }
@@ -165,8 +195,8 @@ export async function runTestCases(
       const expected = tc.expectedOutput.trim()
 
       let verdict: Verdict
-      if (exec.exitCode !== 0 && exec.stderr) {
-        verdict = exec.stderr.toLowerCase().includes('timeout') ? 'TLE' : 'RTE'
+      if (exec.exitCode !== 0) {
+        verdict = exec.stderr.toLowerCase().includes('time') ? 'TLE' : 'RTE'
       } else if (actual === expected) {
         verdict = 'AC'
       } else {
