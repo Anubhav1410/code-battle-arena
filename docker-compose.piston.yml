@@ -1,0 +1,16 @@
+services:
+  piston:
+    image: ghcr.io/engineer-man/piston
+    container_name: piston
+    platform: linux/amd64
+    privileged: true
+    restart: unless-stopped
+    ports:
+      - '2000:2000'
+    tmpfs:
+      - /piston/jobs:exec,uid=1000,gid=1000
+    volumes:
+      - piston-packages:/piston/packages
+
+volumes:
+  piston-packages:
