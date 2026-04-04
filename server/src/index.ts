@@ -50,6 +50,42 @@ app.get('/api/health', (_req, res) => {
   res.json({ success: true, data: { status: 'ok', env: env.nodeEnv } })
 })
 
+// Debug route — test if outbound HTTP works on this host
+app.get('/api/debug/outbound', async (_req, res) => {
+  const results: Record<string, string> = {}
+
+  // Test 1: generic HTTP
+  try {
+    const r = await fetch('https://httpbin.org/get')
+    results.httpbin = `${r.status} OK`
+  } catch (err: unknown) {
+    const e = err as Error & { cause?: Error; code?: string }
+    results.httpbin = `FAIL: ${e.message} | cause: ${e.cause?.message ?? 'none'} | code: ${(e.cause as Error & { code?: string })?.code ?? 'none'}`
+  }
+
+  // Test 2: Judge0 free instance
+  try {
+    const r = await fetch(`${env.judge0ApiUrl}/about`)
+    const body = await r.text()
+    results.judge0 = `${r.status} — ${body.slice(0, 100)}`
+  } catch (err: unknown) {
+    const e = err as Error & { cause?: Error }
+    results.judge0 = `FAIL: ${e.message} | cause: ${e.cause?.message ?? 'none'}`
+  }
+
+  // Test 3: ce.judge0.com
+  try {
+    const r = await fetch('https://ce.judge0.com/about')
+    const body = await r.text()
+    results.judge0_ce = `${r.status} — ${body.slice(0, 100)}`
+  } catch (err: unknown) {
+    const e = err as Error & { cause?: Error }
+    results.judge0_ce = `FAIL: ${e.message} | cause: ${e.cause?.message ?? 'none'}`
+  }
+
+  res.json({ success: true, data: results })
+})
+
 app.use(errorHandler)
 
 setupSocket(io)

@@ -1,38 +1,16 @@
+import { execFile } from 'child_process'
+import { writeFile, unlink, mkdir } from 'fs/promises'
+import path from 'path'
+import os from 'os'
+import crypto from 'crypto'
 import { env } from '../config/env'
 
 // Judge0 language IDs
 const LANGUAGE_IDS: Record<string, number> = {
-  cpp: 54,        // C++ (GCC 9.2.0)
-  python: 71,     // Python (3.8.1)
-  javascript: 63, // JavaScript (Node.js 12.14.0)
-  java: 62,       // Java (OpenJDK 13.0.1)
-}
-
-// Judge0 status IDs
-const STATUS = {
-  IN_QUEUE: 1,
-  PROCESSING: 2,
-  ACCEPTED: 3,
-  WRONG_ANSWER: 4,
-  TIME_LIMIT: 5,
-  COMPILATION_ERROR: 6,
-  RUNTIME_ERROR_SIGSEGV: 7,
-  RUNTIME_ERROR_SIGXFSZ: 8,
-  RUNTIME_ERROR_SIGFPE: 9,
-  RUNTIME_ERROR_SIGABRT: 10,
-  RUNTIME_ERROR_NZEC: 11,
-  RUNTIME_ERROR_OTHER: 12,
-  INTERNAL_ERROR: 13,
-  EXEC_FORMAT_ERROR: 14,
-}
-
-interface Judge0Response {
-  stdout: string | null
-  stderr: string | null
-  compile_output: string | null
-  status: { id: number; description: string }
-  time: string | null
-  memory: number | null
+  cpp: 54,
+  python: 71,
+  javascript: 63,
+  java: 62,
 }
 
 export type Verdict = 'AC' | 'WA' | 'TLE' | 'RTE' | 'CE'
@@ -56,11 +34,12 @@ export interface ExecutionResult {
   compilationError: boolean
 }
 
+// ---------------------------------------------------------------------------
+// Judge0 remote execution
+// ---------------------------------------------------------------------------
+
 function buildHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  }
-  // RapidAPI requires these headers
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   if (env.judge0ApiKey) {
     headers['X-RapidAPI-Key'] = env.judge0ApiKey
     headers['X-RapidAPI-Host'] = 'judge0-ce.p.rapidapi.com'
@@ -68,17 +47,15 @@ function buildHeaders(): Record<string, string> {
   return headers
 }
 
-export async function executeCode(
+async function executeViaJudge0(
   code: string,
   language: string,
   stdin: string,
-  timeLimit: number = 2000,
-  memoryLimit: number = 256
+  timeLimit: number,
+  memoryLimit: number
 ): Promise<ExecutionResult> {
   const languageId = LANGUAGE_IDS[language]
-  if (!languageId) {
-    throw new Error(`Unsupported language: ${language}`)
-  }
+  if (!languageId) throw new Error(`Unsupported language: ${language}`)
 
   const timeLimitSeconds = Math.max(1, Math.min(timeLimit / 1000, 15))
 
@@ -87,61 +64,169 @@ export async function executeCode(
     language_id: languageId,
     stdin: Buffer.from(stdin).toString('base64'),
     cpu_time_limit: timeLimitSeconds,
-    memory_limit: memoryLimit * 1024, // Judge0 expects KB
+    memory_limit: memoryLimit * 1024,
     base64_encoded: true,
     wait: true,
   }
 
-  const start = Date.now()
+  const url = `${env.judge0ApiUrl}/submissions?base64_encoded=true&wait=true&fields=stdout,stderr,compile_output,status,time,memory`
 
-  const response = await fetch(
-    `${env.judge0ApiUrl}/submissions?base64_encoded=true&wait=true&fields=stdout,stderr,compile_output,status,time,memory`,
-    {
+  console.log(`[Executor] Judge0 POST ${url}`)
+
+  const start = Date.now()
+  let response: Response
+
+  try {
+    response = await fetch(url, {
       method: 'POST',
       headers: buildHeaders(),
       body: JSON.stringify(payload),
-    }
-  )
+    })
+  } catch (err: unknown) {
+    const e = err as Error & { cause?: Error & { code?: string } }
+    console.error(`[Executor] Judge0 fetch failed:`, {
+      message: e.message,
+      cause: e.cause?.message,
+      code: e.cause?.code,
+    })
+    throw new Error(`Judge0 unreachable: ${e.cause?.message || e.message}`)
+  }
 
   const elapsed = Date.now() - start
 
   if (!response.ok) {
     const text = await response.text().catch(() => '')
-    throw new Error(`Judge0 API error: ${response.status} ${text}`)
+    console.error(`[Executor] Judge0 HTTP ${response.status}: ${text.slice(0, 200)}`)
+    throw new Error(`Judge0 error: ${response.status}`)
   }
 
-  const result = (await response.json()) as Judge0Response
+  const result = await response.json() as {
+    stdout: string | null
+    stderr: string | null
+    compile_output: string | null
+    status: { id: number }
+    time: string | null
+  }
 
   const stdout = result.stdout ? Buffer.from(result.stdout, 'base64').toString() : ''
   const stderr = result.stderr ? Buffer.from(result.stderr, 'base64').toString() : ''
-  const compileOutput = result.compile_output
-    ? Buffer.from(result.compile_output, 'base64').toString()
-    : ''
+  const compileOutput = result.compile_output ? Buffer.from(result.compile_output, 'base64').toString() : ''
   const statusId = result.status.id
   const timeMs = result.time ? Math.round(parseFloat(result.time) * 1000) : elapsed
 
-  // Compilation error
-  if (statusId === STATUS.COMPILATION_ERROR) {
+  if (statusId === 6) {
+    return { stdout: '', stderr: compileOutput || stderr, exitCode: 1, executionTime: timeMs, compilationError: true }
+  }
+
+  const isRTE = statusId >= 7 && statusId <= 12
+  return {
+    stdout,
+    stderr: stderr || compileOutput,
+    exitCode: isRTE || statusId === 5 ? 1 : 0,
+    executionTime: timeMs,
+    compilationError: false,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Local fallback — runs Python/JS via child_process when Judge0 is unreachable
+// ---------------------------------------------------------------------------
+
+const LOCAL_COMMANDS: Record<string, { cmd: string; ext: string }> = {
+  python: { cmd: 'python3', ext: '.py' },
+  javascript: { cmd: 'node', ext: '.js' },
+}
+
+async function executeLocally(
+  code: string,
+  language: string,
+  stdin: string,
+  timeLimit: number
+): Promise<ExecutionResult> {
+  const config = LOCAL_COMMANDS[language]
+  if (!config) {
     return {
       stdout: '',
-      stderr: compileOutput || stderr,
+      stderr: `Local execution only supports Python and JavaScript. ${language} requires Judge0.`,
       exitCode: 1,
-      executionTime: timeMs,
+      executionTime: 0,
       compilationError: true,
     }
   }
 
-  // Runtime errors
-  const isRuntimeError =
-    statusId >= STATUS.RUNTIME_ERROR_SIGSEGV && statusId <= STATUS.RUNTIME_ERROR_OTHER
+  const tmpDir = path.join(os.tmpdir(), 'cba-exec')
+  await mkdir(tmpDir, { recursive: true })
+  const id = crypto.randomBytes(8).toString('hex')
+  const filePath = path.join(tmpDir, `${id}${config.ext}`)
 
-  return {
-    stdout,
-    stderr: stderr || compileOutput,
-    exitCode: isRuntimeError || statusId === STATUS.TIME_LIMIT ? 1 : 0,
-    executionTime: timeMs,
-    compilationError: false,
+  try {
+    await writeFile(filePath, code)
+
+    const start = Date.now()
+    const timeoutMs = Math.min(timeLimit, 10000)
+
+    return await new Promise<ExecutionResult>((resolve) => {
+      const child = execFile(
+        config.cmd,
+        [filePath],
+        { timeout: timeoutMs, maxBuffer: 1024 * 1024 },
+        (error, stdout, stderr) => {
+          const elapsed = Date.now() - start
+
+          if (error && 'killed' in error && error.killed) {
+            resolve({ stdout: '', stderr: 'Time limit exceeded', exitCode: 1, executionTime: elapsed, compilationError: false })
+            return
+          }
+
+          resolve({
+            stdout: stdout || '',
+            stderr: stderr || '',
+            exitCode: error ? (typeof error.code === 'number' ? error.code : 1) : 0,
+            executionTime: elapsed,
+            compilationError: false,
+          })
+        }
+      )
+
+      if (child.stdin) {
+        child.stdin.write(stdin)
+        child.stdin.end()
+      }
+    })
+  } finally {
+    unlink(filePath).catch(() => {})
   }
+}
+
+// ---------------------------------------------------------------------------
+// Public API — tries Judge0 first, falls back to local execution
+// ---------------------------------------------------------------------------
+
+let judge0Available = true
+let lastJudge0Check = 0
+
+export async function executeCode(
+  code: string,
+  language: string,
+  stdin: string,
+  timeLimit: number = 2000,
+  memoryLimit: number = 256
+): Promise<ExecutionResult> {
+  // Try Judge0 if it was recently reachable (re-check every 60s)
+  if (judge0Available || Date.now() - lastJudge0Check > 60000) {
+    try {
+      const result = await executeViaJudge0(code, language, stdin, timeLimit, memoryLimit)
+      judge0Available = true
+      return result
+    } catch {
+      console.log('[Executor] Judge0 failed, falling back to local execution')
+      judge0Available = false
+      lastJudge0Check = Date.now()
+    }
+  }
+
+  // Fallback to local
+  return executeLocally(code, language, stdin, timeLimit)
 }
 
 export async function runTestCases(
@@ -175,7 +260,6 @@ export async function runTestCases(
           executionTime: exec.executionTime,
           isHidden: tc.isHidden,
         })
-        // CE means all remaining tests also fail
         for (let j = i + 1; j < cases.length; j++) {
           results.push({
             testCase: j + 1,
