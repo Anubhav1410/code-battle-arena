@@ -54,6 +54,8 @@ interface BattleState {
   // Connection
   socket: Socket | null
   connected: boolean
+  reconnecting: boolean
+  disconnectedAt: number | null
 
   // Match state
   matchState: MatchState
@@ -103,6 +105,8 @@ interface BattleState {
 export const useBattleStore = create<BattleState>((set, get) => ({
   socket: null,
   connected: false,
+  reconnecting: false,
+  disconnectedAt: null,
   matchState: 'idle',
   matchId: null,
   problem: null,
@@ -131,15 +135,56 @@ export const useBattleStore = create<BattleState>((set, get) => ({
     const { socket: existingSocket } = get()
     if (existingSocket) return
 
+    let forfeitTimer: ReturnType<typeof setTimeout> | null = null
+
     const socket = connectSocket()
     set({ socket, connected: socket.connected })
 
     socket.on('connect', () => {
-      set({ connected: true })
+      const { matchId, matchState, reconnecting } = get()
+      set({ connected: true, reconnecting: false, disconnectedAt: null })
+
+      // Re-join match room after reconnect
+      if (reconnecting && matchId && matchState !== 'idle' && matchState !== 'finished') {
+        socket.emit('match:join', { matchId })
+      }
+
+      if (forfeitTimer) {
+        clearTimeout(forfeitTimer)
+        forfeitTimer = null
+      }
     })
 
     socket.on('disconnect', () => {
-      set({ connected: false })
+      const { matchState } = get()
+      const inBattle = matchState === 'in_progress' || matchState === 'countdown'
+
+      set({
+        connected: false,
+        reconnecting: inBattle,
+        disconnectedAt: inBattle ? Date.now() : null,
+      })
+
+      // Start 60s forfeit countdown if in a battle
+      if (inBattle) {
+        forfeitTimer = setTimeout(() => {
+          const { connected } = get()
+          if (!connected) {
+            set({ matchState: 'finished', reconnecting: false })
+          }
+        }, 60000)
+      }
+    })
+
+    socket.io.on('reconnect_attempt', () => {
+      set({ reconnecting: true })
+    })
+
+    socket.io.on('reconnect_failed', () => {
+      const { matchState } = get()
+      if (matchState === 'in_progress' || matchState === 'countdown') {
+        set({ matchState: 'finished', reconnecting: false })
+      }
     })
 
     // Matchmaking events
@@ -320,6 +365,8 @@ export const useBattleStore = create<BattleState>((set, get) => ({
       opponentLanguage: 'cpp',
       startedAt: null,
       elapsedMs: 0,
+      reconnecting: false,
+      disconnectedAt: null,
       opponentTyping: false,
       opponentSubmitted: false,
       opponentRanTests: false,

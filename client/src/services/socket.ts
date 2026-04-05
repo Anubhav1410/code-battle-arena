@@ -11,8 +11,10 @@ export const getSocket = (): Socket => {
       auth: { token },
       autoConnect: false,
       reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
+      reconnectionAttempts: 30,
+      reconnectionDelay: 2000,
+      reconnectionDelayMax: 2000,
+      timeout: 10000,
     })
   }
   return socket
@@ -21,7 +23,6 @@ export const getSocket = (): Socket => {
 export const connectSocket = (): Socket => {
   const s = getSocket()
   if (!s.connected) {
-    // Update token in case it changed
     s.auth = { token: localStorage.getItem('token') }
     s.connect()
   }

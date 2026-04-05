@@ -44,6 +44,8 @@ export default function BattleArena() {
     opponentRanTests,
     opponentSolved,
     playerDisconnected,
+    reconnecting,
+    disconnectedAt,
     startedAt,
     elapsedMs,
     testResults,
@@ -326,8 +328,21 @@ export default function BattleArena() {
         </div>
       </div>
 
-      {/* Disconnect warning */}
-      {playerDisconnected && (
+      {/* Reconnecting banner */}
+      {reconnecting && (
+        <div className="bg-accent-red/10 border-b border-accent-red/30 text-accent-red text-center text-sm py-2 flex items-center justify-center gap-2">
+          <div className="w-2 h-2 bg-accent-red rounded-full animate-ping" />
+          Reconnecting...
+          {disconnectedAt && (
+            <span className="text-accent-red/70 ml-1">
+              ({Math.max(0, 60 - Math.floor((Date.now() - disconnectedAt) / 1000))}s before forfeit)
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Opponent disconnect warning */}
+      {playerDisconnected && !reconnecting && (
         <div className="bg-accent-yellow/10 border-b border-accent-yellow/30 text-accent-yellow text-center text-sm py-1">
           {playerDisconnected.username} disconnected — they have 60s to reconnect or forfeit
         </div>

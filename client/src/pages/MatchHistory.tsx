@@ -59,7 +59,7 @@ export default function MatchHistory() {
   const fetchMatches = async () => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ page: String(page), limit: '20' })
+      const params = new URLSearchParams({ page: String(page), limit: '10' })
       if (resultFilter) params.set('result', resultFilter)
       if (diffFilter) params.set('difficulty', diffFilter)
 
